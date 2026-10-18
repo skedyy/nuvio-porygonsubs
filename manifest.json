@@ -1,0 +1,16 @@
+{
+  "name": "PorygonSubs",
+  "version": "1.0.0",
+  "description": "Repositorio con el scraper de PorygonSubs",
+  "scrapers": [
+    {
+      "id": "porygonsubs",
+      "name": "PorygonSubs",
+      "description": "Anime/Pokemon subtitulado (MP4U, DOOD, VOE, FM)",
+      "version": "1.0.0",
+      "filename": "providers/porygonsubs.js",
+      "supportedTypes": ["movie", "tv"],
+      "enabled": true
+    }
+  ]
+}
