@@ -21,6 +21,30 @@ var ALIASES = {
   '220150': 'horizontes-pokemon',
 };
 
+// Proxy opcional (ver worker/worker.js). Si lo pones, los streams MP4 salen como una URL
+// autosuficiente (sin headers), que es lo unico que entienden los reproductores externos
+// y los gestores de descarga. Ej.: 'https://porygon-proxy.TU_USUARIO.workers.dev'
+var PROXY_URL = 'https://porygon-proxy.tigader833.workers.dev/';
+
+// Dominios que el Worker acepta (debe coincidir con ALLOWED_HOSTS del Worker).
+// Lo que NO este aqui sale directo (con headers), para no romper la reproduccion en la app.
+// Para DOOD agrega el dominio del CDN (lo ves con PORY_DEBUG=1), p. ej. 'cloudatacdn.com'.
+var PROXY_HOSTS = ['mp4upload.com'];
+
+function hostOf(u) { return ((String(u).match(/^https?:\/\/([^/:?#]+)/i) || [])[1] || '').toLowerCase(); }
+function proxyAllowed(u) {
+  var h = hostOf(u);
+  if (PROXY_HOSTS.indexOf('*') !== -1) return true;   // modo descubrimiento (temporal)
+  return PROXY_HOSTS.some(function (a) { return h === a || h.slice(-(a.length + 1)) === '.' + a; });
+}
+
+function viaProxy(res) {
+  if (!PROXY_URL || !res || /\.m3u8/i.test(res.url)) return res;   // HLS necesitaria reescribir la playlist
+  if (!proxyAllowed(res.url)) { log('sin proxy (host no permitido):', hostOf(res.url)); return res; }
+  var ref = (res.headers && (res.headers.Referer || res.headers.referer)) || '';
+  return { url: PROXY_URL.replace(/\/+$/, '') + '/?u=' + encodeURIComponent(res.url) + '&r=' + encodeURIComponent(ref), headers: {} };
+}
+
 var DEBUG = (typeof process !== 'undefined' && process.env && process.env.PORY_DEBUG) ? true : false;
 function log() { if (DEBUG) { try { console.log.apply(console, ['[pory]'].concat([].slice.call(arguments))); } catch (e) {} } }
 
@@ -168,12 +192,19 @@ var RND = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
 function doodExtract(embed) {         // patron clasico /pass_md5/ (sin verificar en este sitio)
   var u = embed.replace('/d/', '/e/');
   var host = (u.match(/^https?:\/\/[^/]+/) || [''])[0];
-  return getText(u, { Referer: BASE + '/' }).then(function (html) {
-    var md5 = html && html.match(/\/pass_md5\/[^'"]+/);
+  log('dood: pidiendo embed', u);
+  return get(u, { Referer: BASE + '/' }).then(function (r) {
+    log('dood: embed HTTP', r.status, '| url final', r.url || u);
+    return r.ok ? r.text() : null;
+  }).then(function (html) {
+    if (!html) return null;
+    var md5 = html.match(/\/pass_md5\/[^'"]+/);
+    log('dood: html', html.length, 'bytes | pass_md5', md5 ? 'OK' : 'NO ENCONTRADO', md5 ? '' : '| inicio: ' + html.slice(0, 150).replace(/\s+/g, ' '));
     if (!md5) return null;
     var token = md5[0].split('/').pop();
     return getText(host + md5[0], { Referer: u }).then(function (base) {
-      if (!base) return null;
+      log('dood: pass_md5 respondio', base ? base.slice(0, 80) : 'vacio');
+      if (!base || base.indexOf('http') !== 0) return null;
       var rnd = ''; for (var i = 0; i < 10; i++) rnd += RND.charAt(Math.floor(Math.random() * 62));
       return { url: base + rnd + '?token=' + token + '&expiry=' + Date.now(), headers: { Referer: host + '/', 'User-Agent': UA } };
     });
@@ -189,21 +220,83 @@ function unpack(code) {               // Dean Edwards p,a,c,k,e,d
   return p.replace(/\\'/g, "'").replace(/\b\w+\b/g, function (w) { return d[w] || w; });
 }
 
-function genericExtract(embed) {      // VOE y FM (base): busca un .m3u8/.mp4 en la pagina
-  return getText(embed, { Referer: BASE + '/' }).then(function (html) {
+// VOE responde con una pagina "Redirecting..." que salta por JS a un dominio espejo
+// (window.location.href = 'https://...'). fetch no ejecuta JS, asi que seguimos el salto a mano.
+function fetchFollowingJsRedirect(url, referer, hops) {
+  return getText(url, { Referer: referer }).then(function (html) {
+    if (!html) return { html: null, url: url };
+    var m = html.length < 3000 && html.match(/window\.location\.href\s*=\s*['"](https?:\/\/[^'"]+)['"]/);
+    if (m && hops > 0 && m[1] !== url) {
+      log('redirect JS ->', m[1]);
+      return fetchFollowingJsRedirect(m[1], url, hops - 1);
+    }
+    return { html: html, url: url };
+  });
+}
+
+function genericExtract(embed) {      // VOE (base): busca un .m3u8/.mp4 en la pagina final
+  return fetchFollowingJsRedirect(embed, BASE + '/', 2).then(function (r) {
+    var html = r.html;
     if (!html) return null;
+    log('voe/generic: pagina final', r.url, html.length, 'bytes');
     var packed = html.match(/eval\(function\(p,a,c,k,e,d\)[\s\S]*?\.split\('\|'\)[^)]*\)\)/);
     var src = packed ? (unpack(packed[0]) || html) : html;
     var m = src.match(/https?:[^"'\s\\]+\.(?:m3u8|mp4)[^"'\s\\]*/);
-    return m ? { url: m[0].replace(/\\\//g, '/'), headers: { Referer: embed, 'User-Agent': UA } } : null;
+    if (!m) log('voe/generic: sin .m3u8/.mp4 en claro');
+    return m ? { url: m[0].replace(/\\\//g, '/'), headers: { Referer: r.url, 'User-Agent': UA } } : null;
+  });
+}
+
+// ---- VOE ----
+// La pagina final del espejo trae <script type="application/json">["...cadena ofuscada..."]</script>.
+// Cadena: rot13 -> quitar basura (@$ ^^ ~@ %? *~ !! #&) -> base64 -> restar 3 a cada char
+//         -> invertir -> base64 -> JSON con { source: master.m3u8, direct_access_url: mp4, ... }
+// VOE cambia este esquema de vez en cuando: si falla, el log lo dice y se cae al regex generico.
+function rot13(str) {
+  return str.replace(/[a-zA-Z]/g, function (c) {
+    var b = c <= 'Z' ? 65 : 97;
+    return String.fromCharCode((c.charCodeAt(0) - b + 13) % 26 + b);
+  });
+}
+var VOE_JUNK = ['@$', '^^', '~@', '%?', '*~', '!!', '#&'];
+function voeDecode(blob) {
+  var str = rot13(JSON.parse(blob)[0]);
+  VOE_JUNK.forEach(function (j) { str = str.split(j).join(''); });
+  str = b64decode(str);
+  var t = '';
+  for (var i = 0; i < str.length; i++) t += String.fromCharCode(str.charCodeAt(i) - 3);
+  t = t.split('').reverse().join('');
+  return JSON.parse(b64decode(t));
+}
+
+function voeExtract(embed) {
+  return fetchFollowingJsRedirect(embed, BASE + '/', 2).then(function (r) {
+    if (!r.html) return null;
+    var origin = (r.url.match(/^https?:\/\/[^/]+/) || [''])[0];
+    var m = r.html.match(/<script type="application\/json">(\[[\s\S]*?\])<\/script>/);
+    log('voe: pagina final', r.url, '| bloque json', m ? 'OK' : 'NO');
+    if (m) {
+      try {
+        var j = voeDecode(m[1]);
+        var u = j.source || j.direct_access_url;
+        log('voe: decodificado | source', j.source ? hostOf(j.source) : '-', '| direct_access', j.direct_access_url ? hostOf(j.direct_access_url) : '-');
+        if (u) return { url: u, headers: { Referer: origin + '/', 'User-Agent': UA } };
+      } catch (e) { log('voe: error al decodificar:', e && e.message); }
+    }
+    return genericExtract(embed);
   });
 }
 
 // FM esta desactivado a proposito: su reproductor exige un token de captcha y una
 // atestacion de dispositivo (ver README/notas), asi que no hay forma legitima de
 // obtener el stream desde un plugin. No se intenta para no gastar peticiones.
-var EXTRACTORS = { mp4u: mp4uExtract, dood: doodExtract, voe: genericExtract };
-var LABEL = { fm: 'FM', voe: 'VOE', dood: 'DOOD', mp4u: 'MP4U' };
+var EXTRACTORS = { mp4u: mp4uExtract, dood: doodExtract, voe: voeExtract };
+// Etiquetas visibles en Nuvio. DOOD queda marcado: sale directo (con headers), asi que
+// reproduce en el player interno pero NO sirve para descargar ni para reproductor externo.
+var LABEL = { fm: 'FM', voe: 'VOE', dood: 'DOOD (solo reproducir)', mp4u: 'MP4U' };
+
+// Servidores a ocultar por completo, p. ej. ['dood'] para que no aparezca en la lista.
+var DISABLED_SERVERS = [];
 // 'mega' se omite: archivo cifrado, no hay URL directa reproducible.
 
 // ---------- 4) entrada para Nuvio ----------
@@ -257,7 +350,7 @@ function getStreams(tmdbId, mediaType, season, episode) {
       if (!page) return [];
       var all = parseServers(page.html);
       log('servidores en pagina:', all.map(function (x) { return x.slug; }).join(','));
-      var servers = all.filter(function (x) { return EXTRACTORS[x.slug]; });
+      var servers = all.filter(function (x) { return EXTRACTORS[x.slug] && DISABLED_SERVERS.indexOf(x.slug) === -1; });
       return Promise.all(servers.map(function (sv) {
         var emb = embedUrl(sv);
         var p = emb ? Promise.resolve(emb) : livewireEmbed(page.html, sv, page.cookie);
@@ -265,6 +358,8 @@ function getStreams(tmdbId, mediaType, season, episode) {
           .then(function (res) {
             log(sv.slug, res ? 'stream OK' : 'sin stream');
             if (!res) return null;
+            log(sv.slug, 'stream host:', hostOf(res.url));
+            res = viaProxy(res);
             return { name: 'PorygonSubs - ' + LABEL[sv.slug], title: titles[0] + ' (' + sv.lang + ')',
                      url: res.url, quality: 'HD', headers: res.headers };
           }).catch(function (err) { log(sv.slug, 'error:', err && err.message); return null; });
