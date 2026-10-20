@@ -29,8 +29,7 @@ var PROXY_URL = 'https://porygon-proxy.tigader833.workers.dev/';
 // Dominios que el Worker acepta (debe coincidir con ALLOWED_HOSTS del Worker).
 // Lo que NO este aqui sale directo (con headers), para no romper la reproduccion en la app.
 // Para DOOD agrega el dominio del CDN (lo ves con PORY_DEBUG=1), p. ej. 'cloudatacdn.com'.
-// Para VOE (descarga/externo): agrega 'cloudwindow-route.com' aqui Y en ALLOWED_HOSTS del Worker.
-var PROXY_HOSTS = ['mp4upload.com', 'cloudwindow-route.com'];
+var PROXY_HOSTS = ['mp4upload.com'];
 
 function hostOf(u) { return ((String(u).match(/^https?:\/\/([^/:?#]+)/i) || [])[1] || '').toLowerCase(); }
 function proxyAllowed(u) {
@@ -293,16 +292,21 @@ function voeExtract(embed) {
 // atestacion de dispositivo (ver README/notas), asi que no hay forma legitima de
 // obtener el stream desde un plugin. No se intenta para no gastar peticiones.
 var EXTRACTORS = { mp4u: mp4uExtract, dood: doodExtract, voe: voeExtract };
-// Etiquetas visibles en Nuvio. DOOD queda marcado: sale directo (con headers), asi que
-// reproduce en el player interno pero NO sirve para descargar ni para reproductor externo.
-var LABEL = { fm: 'FM', voe: 'VOE', dood: 'DOOD (solo reproducir)', mp4u: 'MP4U' };
+// Etiquetas visibles en Nuvio. El sufijo " (solo reproducir)" se agrega solo a los streams que salen
+// DIRECTOS (con headers): sirven en el player interno, pero no para descargar ni reproductor externo.
+// Los que salen por el proxy (URL sin headers) llevan el nombre limpio = aptos para descargar.
+// VOE lleva rayo: es el mas rapido.
+var LABEL = { fm: 'FM', voe: 'VOE \u26A1', dood: 'DOOD', mp4u: 'MP4U' };
 
 // Servidores a ocultar por completo, p. ej. ['dood'] para que no aparezca en la lista.
 var DISABLED_SERVERS = [];
 
-// Servidores que se ofrecen DOS veces cuando el proxy aplica: una directa (con headers, para
-// el player interno) y otra "(descarga/externo)" por el proxy (URL sin headers).
-var DUAL_STREAMS = ['voe'];
+// Servidores que NUNCA pasan por el proxy: solo reproducir (VOE es HLS y el downloader de Nuvio
+// no baja HLS; ademas ya es rapido en directo).
+var PLAY_ONLY = ['voe'];
+
+// Servidores que se ofrecen DOS veces (directa + "(descarga/externo)" por proxy). Vacio por ahora.
+var DUAL_STREAMS = [];
 // 'mega' se omite: archivo cifrado, no hay URL directa reproducible.
 
 // ---------- 4) entrada para Nuvio ----------
@@ -365,10 +369,13 @@ function getStreams(tmdbId, mediaType, season, episode) {
             log(sv.slug, res ? 'stream OK' : 'sin stream');
             if (!res) return [];
             log(sv.slug, 'stream host:', hostOf(res.url));
-            var direct = res, prox = viaProxy(res), common = { title: titles[0] + ' (' + sv.lang + ')', quality: 'HD' };
-            var mk = function (suffix, r) { return { name: 'PorygonSubs - ' + LABEL[sv.slug] + suffix, title: common.title, url: r.url, quality: common.quality, headers: r.headers }; };
-            if (prox === direct) return [mk('', direct)];
-            if (DUAL_STREAMS.indexOf(sv.slug) !== -1) return [mk('', direct), mk(' (descarga/externo)', prox)];
+            var direct = res;
+            var prox = PLAY_ONLY.indexOf(sv.slug) !== -1 ? direct : viaProxy(res);
+            var title = titles[0] + ' (' + sv.lang + ')';
+            var mk = function (suffix, r) { return { name: 'PorygonSubs - ' + LABEL[sv.slug] + suffix, title: title, url: r.url, quality: 'HD', headers: r.headers }; };
+            var PLAY = ' (solo reproducir)';
+            if (prox === direct) return [mk(PLAY, direct)];
+            if (DUAL_STREAMS.indexOf(sv.slug) !== -1) return [mk(PLAY, direct), mk('', prox)];
             return [mk('', prox)];
           }).catch(function (err) { log(sv.slug, 'error:', err && err.message); return []; });
       })).then(function (out) { return [].concat.apply([], out); });

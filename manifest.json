@@ -1,13 +1,13 @@
 {
   "name": "PorygonSubs",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Repositorio con el scraper de PorygonSubs",
   "scrapers": [
     {
       "id": "porygonsubs",
       "name": "PorygonSubs",
-      "description": "Anime/Pokemon subtitulado (MP4U, DOOD)",
-      "version": "1.1.0",
+      "description": "Anime/Pokemon subtitulado: MP4U y DOOD (descarga), VOE rapido (solo reproducir)",
+      "version": "1.2.0",
       "filename": "providers/porygonsubs.js",
       "supportedTypes": [
         "movie",
