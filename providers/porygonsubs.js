@@ -29,7 +29,8 @@ var PROXY_URL = 'https://porygon-proxy.tigader833.workers.dev/';
 // Dominios que el Worker acepta (debe coincidir con ALLOWED_HOSTS del Worker).
 // Lo que NO este aqui sale directo (con headers), para no romper la reproduccion en la app.
 // Para DOOD agrega el dominio del CDN (lo ves con PORY_DEBUG=1), p. ej. 'cloudatacdn.com'.
-var PROXY_HOSTS = ['mp4upload.com'];
+// Para VOE (descarga/externo): agrega 'cloudwindow-route.com' aqui Y en ALLOWED_HOSTS del Worker.
+var PROXY_HOSTS = ['mp4upload.com', 'cloudwindow-route.com'];
 
 function hostOf(u) { return ((String(u).match(/^https?:\/\/([^/:?#]+)/i) || [])[1] || '').toLowerCase(); }
 function proxyAllowed(u) {
@@ -39,7 +40,7 @@ function proxyAllowed(u) {
 }
 
 function viaProxy(res) {
-  if (!PROXY_URL || !res || /\.m3u8/i.test(res.url)) return res;   // HLS necesitaria reescribir la playlist
+  if (!PROXY_URL || !res) return res;
   if (!proxyAllowed(res.url)) { log('sin proxy (host no permitido):', hostOf(res.url)); return res; }
   var ref = (res.headers && (res.headers.Referer || res.headers.referer)) || '';
   return { url: PROXY_URL.replace(/\/+$/, '') + '/?u=' + encodeURIComponent(res.url) + '&r=' + encodeURIComponent(ref), headers: {} };
@@ -278,7 +279,8 @@ function voeExtract(embed) {
     if (m) {
       try {
         var j = voeDecode(m[1]);
-        var u = j.source || j.direct_access_url;
+        // direct_access_url solo se usa si el propio VOE lo habilita (direct_access_allowed); si no, HLS.
+        var u = (j.direct_access_allowed === true && j.direct_access_url) ? j.direct_access_url : (j.source || null);
         log('voe: decodificado | source', j.source ? hostOf(j.source) : '-', '| direct_access', j.direct_access_url ? hostOf(j.direct_access_url) : '-');
         if (u) return { url: u, headers: { Referer: origin + '/', 'User-Agent': UA } };
       } catch (e) { log('voe: error al decodificar:', e && e.message); }
@@ -297,6 +299,10 @@ var LABEL = { fm: 'FM', voe: 'VOE', dood: 'DOOD (solo reproducir)', mp4u: 'MP4U'
 
 // Servidores a ocultar por completo, p. ej. ['dood'] para que no aparezca en la lista.
 var DISABLED_SERVERS = [];
+
+// Servidores que se ofrecen DOS veces cuando el proxy aplica: una directa (con headers, para
+// el player interno) y otra "(descarga/externo)" por el proxy (URL sin headers).
+var DUAL_STREAMS = ['voe'];
 // 'mega' se omite: archivo cifrado, no hay URL directa reproducible.
 
 // ---------- 4) entrada para Nuvio ----------
@@ -357,13 +363,15 @@ function getStreams(tmdbId, mediaType, season, episode) {
         return p.then(function (e) { log(sv.slug, 'embed:', e); return e ? EXTRACTORS[sv.slug](e) : null; })
           .then(function (res) {
             log(sv.slug, res ? 'stream OK' : 'sin stream');
-            if (!res) return null;
+            if (!res) return [];
             log(sv.slug, 'stream host:', hostOf(res.url));
-            res = viaProxy(res);
-            return { name: 'PorygonSubs - ' + LABEL[sv.slug], title: titles[0] + ' (' + sv.lang + ')',
-                     url: res.url, quality: 'HD', headers: res.headers };
-          }).catch(function (err) { log(sv.slug, 'error:', err && err.message); return null; });
-      })).then(function (out) { return out.filter(Boolean); });
+            var direct = res, prox = viaProxy(res), common = { title: titles[0] + ' (' + sv.lang + ')', quality: 'HD' };
+            var mk = function (suffix, r) { return { name: 'PorygonSubs - ' + LABEL[sv.slug] + suffix, title: common.title, url: r.url, quality: common.quality, headers: r.headers }; };
+            if (prox === direct) return [mk('', direct)];
+            if (DUAL_STREAMS.indexOf(sv.slug) !== -1) return [mk('', direct), mk(' (descarga/externo)', prox)];
+            return [mk('', prox)];
+          }).catch(function (err) { log(sv.slug, 'error:', err && err.message); return []; });
+      })).then(function (out) { return [].concat.apply([], out); });
     });
   }).catch(function (err) { log('ERROR:', err && err.message); return []; });
 }
